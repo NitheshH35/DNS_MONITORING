@@ -2,7 +2,8 @@ from scapy.all import sniff, DNS, DNSQR
 import sqlite3
 from datetime import datetime
 
-DB_PATH = "database.db"
+DB_PATH = r"C:\Users\Nithesh\OneDrive\Desktop\dns-monitoring\backend\database.db"
+
 
 def log_dns_query(domain, src_ip, timestamp):
     conn = sqlite3.connect(DB_PATH)

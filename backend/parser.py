@@ -1,5 +1,7 @@
 # backend/parser.py
 from scapy.all import *
+from scapy.layers.dns import DNSQR
+from scapy.layers.inet import IP
 from datetime import datetime
 import sqlite3
 
