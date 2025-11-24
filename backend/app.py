@@ -21,12 +21,24 @@ def q(sql, params=()):
     return rows
 
 def rows_to_logs(rows):
-    return [{'domain': r[0], 'src_ip': r[1], 'timestamp': r[2]} for r in rows]
+    # rows = SELECT domain, src_ip, dst_ip, timestamp ...
+    return [
+        {
+            "domain": r[0],
+            "src_ip": r[1],
+            "dst_ip": r[2],
+            "timestamp": r[3],
+        }
+        for r in rows
+    ]
 
 # ---------- APIs ----------
 @app.route('/logs')
 def logs():
-    rows = q("SELECT domain, src_ip, timestamp FROM dns_logs ORDER BY id DESC LIMIT 500")
+    # now also selecting dst_ip
+    rows = q(
+        "SELECT domain, src_ip, dst_ip, timestamp FROM dns_logs ORDER BY id DESC LIMIT 500"
+    )
     return jsonify(rows_to_logs(rows))
 
 @app.route('/stats')
@@ -77,6 +89,7 @@ def is_suspicious(domain: str) -> list[str]:
 @app.route('/alerts')
 def alerts():
     # suspicious by heuristics (last 1000 rows)
+    # we only need domain, src_ip, timestamp here
     recent = q("""
         SELECT domain, src_ip, timestamp
         FROM dns_logs
@@ -87,7 +100,13 @@ def alerts():
     for domain, src_ip, ts in recent:
         flags = is_suspicious(domain)
         if flags:
-            susp.append({'type': 'SuspiciousDomain', 'domain': domain, 'src_ip': src_ip, 'timestamp': ts, 'flags': flags})
+            susp.append({
+                'type': 'SuspiciousDomain',
+                'domain': domain,
+                'src_ip': src_ip,
+                'timestamp': ts,
+                'flags': flags
+            })
 
     # high frequency by IP (>= 60/min in last 1 min)
     burst = q("""
@@ -104,10 +123,11 @@ def alerts():
 
 @app.route('/export/csv')
 def export_csv():
-    rows = q("SELECT domain, src_ip, timestamp FROM dns_logs ORDER BY id DESC")
+    # include dst_ip in export as well
+    rows = q("SELECT domain, src_ip, dst_ip, timestamp FROM dns_logs ORDER BY id DESC")
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['domain', 'src_ip', 'timestamp'])
+    writer.writerow(['domain', 'src_ip', 'dst_ip', 'timestamp'])
     writer.writerows(rows)
     csv_data = output.getvalue()
     output.close()
@@ -123,13 +143,26 @@ def ingest():
     data = request.get_json(force=True)
     domain = data.get('domain')
     src_ip = data.get('src_ip')
+    dst_ip = data.get('dst_ip')   # 👈 NEW
     ts = data.get('timestamp') or dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     if not (domain and src_ip):
         return jsonify({'ok': False, 'error': 'missing fields'}), 400
-    # insert
-    q("INSERT INTO dns_logs (domain, src_ip, timestamp) VALUES (?, ?, ?)", (domain, src_ip, ts))
-    # notify websocket clients
-    socketio.emit('new_log', {'domain': domain, 'src_ip': src_ip, 'timestamp': ts})
+
+    # insert with dst_ip
+    q(
+        "INSERT INTO dns_logs (domain, src_ip, dst_ip, timestamp) VALUES (?, ?, ?, ?)",
+        (domain, src_ip, dst_ip, ts)
+    )
+
+    # notify websocket clients (frontend expects dst_ip field)
+    socketio.emit('new_log', {
+        'domain': domain,
+        'src_ip': src_ip,
+        'dst_ip': dst_ip,
+        'timestamp': ts
+    })
+
     return jsonify({'ok': True})
 
 # (Optional) serve built frontend if you ever run npm run build

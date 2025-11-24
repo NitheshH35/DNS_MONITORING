@@ -1,15 +1,18 @@
 import sqlite3
 
+DB_PATH = r"C:\Users\Nithesh\OneDrive\Desktop\dns-monitoring\backend\database.db"
+
 # Connect (creates database.db if it doesn't exist)
-conn = sqlite3.connect("database.db")
+conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
-# Create the table for storing DNS logs
+# Create the table for storing DNS logs (now with dst_ip)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS dns_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT,
     src_ip TEXT,
+    dst_ip TEXT,
     timestamp TEXT
 )
 """)
