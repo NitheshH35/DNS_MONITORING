@@ -73,18 +73,91 @@ def stats():
         'perMinute': [{'minute': m, 'count': c} for m, c in per_min],
     })
 
-# simple suspicious heuristics
-SUSPICIOUS_TLDS = ('.ru', '.cc', '.xyz', '.top', '.kim')
-KEYWORDS = ('bot', 'freecdn', 'cdn', 'mal', 'tunnel', 'jwpcdn', 'amung', 'whos', 'mirror')
+# ---------- Suspicious domain heuristics (advanced) ----------
+
+SUSPICIOUS_TLDS = (
+    '.ru', '.cc', '.xyz', '.top', '.kim', '.cn', '.tk', '.gq', '.ml', '.ga'
+)
+
+KEYWORDS = (
+    'bot', 'freecdn', 'cdn', 'mal', 'tunnel', 'jwpcdn', 'amung', 'whos',
+    'mirror', 'crypto', 'miner', 'wallet', 'click', 'track', 'adserv'
+)
+
+# Possible brand phishing patterns (fake login pages)
+BRAND_WORDS = (
+    'google', 'facebook', 'instagram', 'microsoft', 'paypal', 'amazon', 'apple'
+)
+PHISH_WORDS = (
+    'login', 'signin', 'verify', 'update', 'secure', 'support', 'reset'
+)
+
 LONG_LABEL = re.compile(r'[a-z0-9]{16,}', re.I)  # long random-looking label
 
+
+def shannon_entropy(s: str) -> float:
+    """Rough measure of randomness: higher = more random."""
+    if not s:
+        return 0.0
+    from math import log2
+    freq = {}
+    for ch in s:
+        freq[ch] = freq.get(ch, 0) + 1
+    ent = 0.0
+    length = len(s)
+    for c in freq.values():
+        p = c / length
+        ent -= p * log2(p)
+    return ent
+
+
 def is_suspicious(domain: str) -> list[str]:
-    flags = []
-    d = domain.lower()
-    if any(d.endswith(tld) for tld in SUSPICIOUS_TLDS): flags.append('TLD')
-    if any(k in d for k in KEYWORDS): flags.append('Keyword')
-    if any(LONG_LABEL.search(part) for part in d.strip('.').split('.')): flags.append('LongSubdomain')
+    flags: list[str] = []
+    d = domain.lower().strip('.')
+    parts = d.split('.')
+
+    # 1) TLD heuristic
+    if any(d.endswith(tld) for tld in SUSPICIOUS_TLDS):
+        flags.append('TLD')
+
+    # 2) Simple keyword heuristic
+    if any(k in d for k in KEYWORDS):
+        flags.append('Keyword')
+
+    # 3) Very long random-looking subdomain label
+    for part in parts:
+        if LONG_LABEL.search(part):
+            flags.append('LongSubdomain')
+            break
+
+    # 4) High entropy = random DGA-like labels
+    # Check only the left-most label (before first dot)
+    main_label = parts[0] if parts else ""
+    ent = shannon_entropy(main_label)
+    if len(main_label) >= 12 and ent >= 3.5:
+        flags.append('HighEntropyLabel')
+
+    # 5) Many subdomains (deep nesting) – often used to hide stuff
+    if len(parts) >= 5:
+        flags.append('DeepSubdomainChain')
+
+    # 6) Brand impersonation (brand + phishing word)
+    for brand in BRAND_WORDS:
+        if brand in d:
+            for pw in PHISH_WORDS:
+                if pw in d:
+                    flags.append(f'BrandImpersonation:{brand}')
+                    break
+
+    # 7) Mix of letters and digits in long label (common in malware beacons)
+    if len(main_label) >= 10:
+        has_digit = any(ch.isdigit() for ch in main_label)
+        has_alpha = any(ch.isalpha() for ch in main_label)
+        if has_digit and has_alpha:
+            flags.append('AlphaNumericLabel')
+
     return flags
+
 
 @app.route('/alerts')
 def alerts():
