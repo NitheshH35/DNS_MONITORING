@@ -3,6 +3,13 @@ from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
 from flask_socketio import SocketIO
 import sqlite3, csv, io, re, datetime as dt
+import math
+import tldextract
+import idna
+import whois
+from datetime import datetime, timedelta
+from collections import Counter
+import os
 
 DB_PATH = r"C:\Users\Nithesh\OneDrive\Desktop\dns-monitoring\backend\database.db"
 
@@ -35,7 +42,6 @@ def rows_to_logs(rows):
 # ---------- APIs ----------
 @app.route('/logs')
 def logs():
-    # now also selecting dst_ip
     rows = q(
         "SELECT domain, src_ip, dst_ip, timestamp FROM dns_logs ORDER BY id DESC LIMIT 500"
     )
@@ -73,96 +79,183 @@ def stats():
         'perMinute': [{'minute': m, 'count': c} for m, c in per_min],
     })
 
-# ---------- Suspicious domain heuristics (advanced) ----------
 
-SUSPICIOUS_TLDS = (
-    '.ru', '.cc', '.xyz', '.top', '.kim', '.cn', '.tk', '.gq', '.ml', '.ga'
-)
+# ---------- Layered detection pipeline (fast -> slow) ----------
+# Tunable thresholds
+ENTROPY_THRESHOLD = 3.5      # tune between 3.5..4.0
+ENTROPY_MIN_LABEL_LEN = 8
+NEW_DOMAIN_DAYS = 30         # consider domains <30 days as suspicious
+WHOIS_CACHE_TTL_DAYS = 7     # refresh whois cache after 7 days
 
-KEYWORDS = (
-    'bot', 'freecdn', 'cdn', 'mal', 'tunnel', 'jwpcdn', 'amung', 'whos',
-    'mirror', 'crypto', 'miner', 'wallet', 'click', 'track', 'adserv'
-)
+# static lists (tweak where needed)
+SUSPICIOUS_TLDS = ('.ru', '.cc', '.xyz', '.top', '.kim', '.cn', '.tk', '.gq', '.ml', '.ga')
+KEYWORDS = ('bot', 'freecdn', 'cdn', 'mal', 'tunnel', 'jwpcdn', 'amung', 'whos', 'mirror', 'crypto', 'miner', 'wallet', 'click', 'track', 'adserv')
+BRAND_WORDS = ('google', 'facebook', 'instagram', 'microsoft', 'paypal', 'amazon', 'apple')
+PHISH_WORDS = ('login', 'signin', 'verify', 'update', 'secure', 'support', 'reset')
+LONG_LABEL_RE = re.compile(r'[a-z0-9]{16,}', re.I)
 
-# Possible brand phishing patterns (fake login pages)
-BRAND_WORDS = (
-    'google', 'facebook', 'instagram', 'microsoft', 'paypal', 'amazon', 'apple'
-)
-PHISH_WORDS = (
-    'login', 'signin', 'verify', 'update', 'secure', 'support', 'reset'
-)
+# optional local blocklist file (one domain per line)
+BLOCKLIST = set()
+BLOCKLIST_PATH = os.path.join(os.path.dirname(__file__), "blocklist.txt")
+if os.path.exists(BLOCKLIST_PATH):
+    with open(BLOCKLIST_PATH, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip().lower()
+            if ln and not ln.startswith("#"):
+                BLOCKLIST.add(ln)
 
-LONG_LABEL = re.compile(r'[a-z0-9]{16,}', re.I)  # long random-looking label
-
-
-def shannon_entropy(s: str) -> float:
-    """Rough measure of randomness: higher = more random."""
+def calculate_entropy(s: str) -> float:
     if not s:
         return 0.0
-    from math import log2
-    freq = {}
-    for ch in s:
-        freq[ch] = freq.get(ch, 0) + 1
-    ent = 0.0
+    freq = Counter(s)
     length = len(s)
-    for c in freq.values():
-        p = c / length
-        ent -= p * log2(p)
+    ent = 0.0
+    for v in freq.values():
+        p = v / length
+        ent -= p * math.log2(p)
     return ent
 
+def whois_cached(domain: str):
+    """
+    Return creation_date as datetime or None.
+    Uses whois_cache table to avoid repeated whois calls.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
 
-def is_suspicious(domain: str) -> list[str]:
-    flags: list[str] = []
+    # check cache
+    cur.execute("SELECT creation_date, fetched_at FROM whois_cache WHERE domain = ?", (domain,))
+    row = cur.fetchone()
+    now = datetime.utcnow()
+    if row:
+        creation_date_str, fetched_at_str = row
+        try:
+            if fetched_at_str:
+                fetched_at = datetime.fromisoformat(fetched_at_str)
+                if (now - fetched_at).days <= WHOIS_CACHE_TTL_DAYS:
+                    conn.close()
+                    if not creation_date_str:
+                        return None
+                    return datetime.fromisoformat(creation_date_str)
+        except Exception:
+            pass
+
+    # not cached or expired -> perform whois (slow)
+    creation_date = None
+    try:
+        w = whois.whois(domain)
+        cd = w.creation_date
+        if isinstance(cd, list) and cd:
+            cd = cd[0]
+        if isinstance(cd, datetime):
+            creation_date = cd
+        else:
+            # attempt parse if string
+            try:
+                creation_date = datetime.fromisoformat(str(cd))
+            except Exception:
+                creation_date = None
+    except Exception:
+        creation_date = None
+
+    # update cache
+    try:
+        cur.execute(
+            "REPLACE INTO whois_cache (domain, creation_date, fetched_at) VALUES (?, ?, ?)",
+            (domain, creation_date.isoformat() if creation_date else None, now.isoformat())
+        )
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+    return creation_date
+
+def detection_pipeline(domain: str) -> dict:
+    """
+    Returns dict:
+      { 'flags': [...], 'confidence': 'low'|'medium'|'high', 'layers': {'1': [...], '2': [...], '3': [...]} }
+    """
+    flags = []
+    layers = {'1': [], '2': [], '3': []}
     d = domain.lower().strip('.')
-    parts = d.split('.')
 
-    # 1) TLD heuristic
+    # Blocklist exact or suffix match (fast)
+    for bad in BLOCKLIST:
+        if d == bad or d.endswith("." + bad):
+            layers['1'].append('Blocklist')
+            flags.append('Blocklist')
+            return {'flags': flags, 'confidence': 'high', 'layers': layers}
+
+    te = tldextract.extract(d)
+    # choose main label: prefer leftmost subdomain or domain
+    if te.subdomain:
+        main_label = te.subdomain.split('.')[-1]
+    else:
+        main_label = te.domain or ''
+
+    # ------ Layer 1: Static local checks (fast) ------
     if any(d.endswith(tld) for tld in SUSPICIOUS_TLDS):
-        flags.append('TLD')
+        layers['1'].append('TLD'); flags.append('TLD')
 
-    # 2) Simple keyword heuristic
     if any(k in d for k in KEYWORDS):
-        flags.append('Keyword')
+        layers['1'].append('Keyword'); flags.append('Keyword')
 
-    # 3) Very long random-looking subdomain label
-    for part in parts:
-        if LONG_LABEL.search(part):
-            flags.append('LongSubdomain')
-            break
+    if any(LONG_LABEL_RE.search(part) for part in d.split('.')):
+        layers['1'].append('LongSubdomain'); flags.append('LongSubdomain')
 
-    # 4) High entropy = random DGA-like labels
-    # Check only the left-most label (before first dot)
-    main_label = parts[0] if parts else ""
-    ent = shannon_entropy(main_label)
-    if len(main_label) >= 12 and ent >= 3.5:
-        flags.append('HighEntropyLabel')
+    ent = calculate_entropy(main_label)
+    if len(main_label) >= ENTROPY_MIN_LABEL_LEN and ent >= ENTROPY_THRESHOLD:
+        layers['1'].append(f'HighEntropy:{ent:.2f}'); flags.append('HighEntropyLabel')
 
-    # 5) Many subdomains (deep nesting) – often used to hide stuff
-    if len(parts) >= 5:
-        flags.append('DeepSubdomainChain')
+    # If layer1 already finds 2+ issues => high confidence and skip slow checks
+    if len(layers['1']) >= 2:
+        return {'flags': flags, 'confidence': 'high', 'layers': layers}
 
-    # 6) Brand impersonation (brand + phishing word)
+    # ------ Layer 2: Homograph / IDN / spoofing (medium) ------
+    try:
+        encoded = idna.encode(domain).decode('ascii')
+        if encoded.startswith('xn--'):
+            layers['2'].append(f'Punycode:{encoded}'); flags.append('IDN/Punycode')
+    except idna.IDNAError:
+        layers['2'].append('IDNError'); flags.append('IDNError')
+
+    # Brand impersonation (brand + phishing word)
     for brand in BRAND_WORDS:
         if brand in d:
             for pw in PHISH_WORDS:
                 if pw in d:
+                    layers['2'].append(f'BrandImpersonation:{brand}')
                     flags.append(f'BrandImpersonation:{brand}')
                     break
 
-    # 7) Mix of letters and digits in long label (common in malware beacons)
-    if len(main_label) >= 10:
-        has_digit = any(ch.isdigit() for ch in main_label)
-        has_alpha = any(ch.isalpha() for ch in main_label)
-        if has_digit and has_alpha:
-            flags.append('AlphaNumericLabel')
+    if layers['2']:
+        return {'flags': flags, 'confidence': 'high' if layers['2'] else 'medium', 'layers': layers}
 
-    return flags
+    # ------ Layer 3: Registration analysis / WHOIS (slow) ------
+    # use registered_domain (example.com) or domain fallback
+    registered = te.registered_domain or te.domain or d
+    creation_date = whois_cached(registered)
+    if creation_date:
+        age_days = (datetime.utcnow() - creation_date).days
+        layers['3'].append(f'AgeDays:{age_days}')
+        if age_days >= 0 and age_days < NEW_DOMAIN_DAYS:
+            flags.append('NewlyRegistered')
+    else:
+        layers['3'].append('WhoisUnknown')
+
+    # Final confidence
+    if flags:
+        confidence = 'high' if ('TLD' in flags or any(f.startswith('BrandImpersonation') for f in flags) or 'NewlyRegistered' in flags) else 'medium'
+    else:
+        confidence = 'low'
+
+    return {'flags': flags, 'confidence': confidence, 'layers': layers}
 
 
+# ---------- Alerts endpoint (uses detection pipeline) ----------
 @app.route('/alerts')
 def alerts():
-    # suspicious by heuristics (last 1000 rows)
-    # we only need domain, src_ip, timestamp here
+    # recent rows (domain, src_ip, timestamp)
     recent = q("""
         SELECT domain, src_ip, timestamp
         FROM dns_logs
@@ -170,15 +263,26 @@ def alerts():
         LIMIT 1000
     """)
     susp = []
+    seen_domains = set()
+
+    # dedupe — run expensive checks once per domain only
     for domain, src_ip, ts in recent:
-        flags = is_suspicious(domain)
-        if flags:
+        if not domain:
+            continue
+        if domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+
+        res = detection_pipeline(domain)
+        if res['flags']:
             susp.append({
                 'type': 'SuspiciousDomain',
                 'domain': domain,
-                'src_ip': src_ip,
+                'src_ip': src_ip,     # sample source IP (first seen in recent rows)
                 'timestamp': ts,
-                'flags': flags
+                'flags': res['flags'],
+                'confidence': res['confidence'],
+                'layers': res['layers']
             })
 
     # high frequency by IP (>= 60/min in last 1 min)
@@ -193,6 +297,7 @@ def alerts():
     freq = [{'type':'HighFrequency', 'src_ip': ip, 'count': c} for ip, c in burst]
 
     return jsonify({'alerts': susp + freq})
+
 
 @app.route('/export/csv')
 def export_csv():
