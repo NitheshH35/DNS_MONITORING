@@ -309,7 +309,8 @@ export default function App() {
                     <YAxis />
                     <Tooltip />
                     <Legend />
-                    <Bar dataKey="count" />
+                    <Bar dataKey="count" fill="#00eaff" />
+
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -327,6 +328,13 @@ export default function App() {
                       nameKey="ip"
                       label
                     />
+                    {stats.topIPs?.map((entry, index) => (
+                      <Cell
+                      key={`cell-${index}`}
+                      fill={index % 2 === 0 ? "#00ff7f" : "#ff4d4d"} // green & red
+                      />
+                      ))}
+
                     <Tooltip />
                     <Legend />
                   </PieChart>
