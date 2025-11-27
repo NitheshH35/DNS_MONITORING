@@ -1,4 +1,6 @@
+# backend/update_blocklist.py
 import requests
+from pathlib import Path
 
 SOURCES = [
     "https://v.firebog.net/hosts/Prigent-Malware.txt",
@@ -8,23 +10,31 @@ SOURCES = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/tif.txt",
 ]
 
-OUTPUT = "blocklist.txt"
+OUT = Path("blocklist.txt")
 
-all_domains = set()
-
+domains = set()
 for url in SOURCES:
-    print(f"Downloading {url}...")
+    print("Downloading", url)
     try:
-        data = requests.get(url, timeout=10).text
-        for line in data.splitlines():
-            line = line.strip().lower()
-            if line and not line.startswith("#") and "." in line:
-                all_domains.add(line)
-    except:
-        print(f"Failed: {url}")
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            for ln in r.text.splitlines():
+                ln = ln.strip().lower()
+                if not ln or ln.startswith("#"):
+                    continue
+                # Some lists include hosts file format that starts with 0.0.0.0 example.com
+                parts = ln.split()
+                if len(parts) >= 1:
+                    item = parts[-1]
+                else:
+                    item = ln
+                if "." in item and len(item) > 3:
+                    domains.add(item)
+        else:
+            print("Failed to download:", url, "status:", r.status_code)
+    except Exception as e:
+        print("Error downloading", url, e)
 
-with open(OUTPUT, "w", encoding="utf-8") as f:
-    for d in sorted(all_domains):
-        f.write(d + "\n")
-
-print(f"Saved {len(all_domains)} domains to blocklist.txt")
+print("Total domains collected:", len(domains))
+OUT.write_text("\n".join(sorted(domains)), encoding="utf-8")
+print("Saved to", OUT)

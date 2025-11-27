@@ -13,9 +13,12 @@ import {
   Line,
   CartesianGrid,
   Legend,
+  Cell,
 } from "recharts";
 
 const API = "http://127.0.0.1:5000";
+
+const PIE_COLORS = ["#00FF7F", "#FF4D4D", "#00EAFf", "#FFD166", "#7C4DFF", "#FF7AB6"];
 
 export default function App() {
   const [logs, setLogs] = useState([]);
@@ -40,7 +43,7 @@ export default function App() {
         ]);
         setLogs(l || []);
         setStats(s || { topDomains: [], topIPs: [], perMinute: [] });
-        setAlerts(a?.alerts || []);
+        setAlerts((a && a.alerts) || []);
         setLastUpdated(new Date());
       } catch (err) {
         console.error("Fetch error:", err);
@@ -74,7 +77,8 @@ export default function App() {
   }, []);
 
   const exportCsv = () => {
-    window.location.href = `${API}/export/csv`;
+    // open in new tab so SPA doesn't navigate away
+    window.open(`${API}/export/csv`, "_blank");
   };
 
   const suspiciousCount = useMemo(
@@ -87,10 +91,7 @@ export default function App() {
     [logs]
   );
 
-  const uniqueIPs = useMemo(
-    () => new Set(logs.map((l) => l.src_ip)).size,
-    [logs]
-  );
+  const uniqueIPs = useMemo(() => new Set(logs.map((l) => l.src_ip)).size, [logs]);
 
   // Clock for the side widget
   const [now, setNow] = useState(new Date());
@@ -99,15 +100,18 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  const timeString = now
-    .toLocaleTimeString("en-IN", { hour12: false })
-    .split(":");
+  const timeString = now.toLocaleTimeString("en-IN", { hour12: false }).split(":");
   const dateString = now.toLocaleString("en-IN", {
     weekday: "short",
     day: "2-digit",
     month: "short",
     year: "numeric",
   });
+
+  // Defensive: ensure arrays exist for charts
+  const topDomains = stats?.topDomains || [];
+  const topIPs = stats?.topIPs || [];
+  const perMinute = stats?.perMinute || [];
 
   return (
     <div className={`app-container ${dark ? "" : "theme-light"}`}>
@@ -117,9 +121,7 @@ export default function App() {
           <h1>
             <span className="h1-accent">DNS</span> Monitoring Console
           </h1>
-          <div className="subtitle">
-            Real-time visibility into DNS queries on your network
-          </div>
+          <div className="subtitle">Real-time visibility into DNS queries on your network</div>
         </div>
 
         <div className="app-header-right">
@@ -132,10 +134,7 @@ export default function App() {
             ⬇ Export CSV
           </button>
 
-          <button
-            className="btn-toggle"
-            onClick={() => setDark((prev) => !prev)}
-          >
+          <button className="btn-toggle" onClick={() => setDark((prev) => !prev)}>
             {dark ? "☀ Light Theme" : "🌙 Dark Theme"}
           </button>
         </div>
@@ -154,11 +153,7 @@ export default function App() {
             </div>
             <div className="status-item">
               <span className="status-label">WebSocket</span>
-              <span
-                className={`status-value ${
-                  wsConnected ? "online" : ""
-                }`.trim()}
-              >
+              <span className={`status-value ${wsConnected ? "online" : ""}`.trim()}>
                 {wsConnected ? "CONNECTED" : "DISCONNECTED"}
               </span>
             </div>
@@ -176,23 +171,14 @@ export default function App() {
             </div>
             <div className="status-item">
               <span className="status-label">Suspicious Alerts</span>
-              <span
-                className="status-value"
-                style={{
-                  color: suspiciousCount ? "#ff4b4b" : undefined,
-                }}
-              >
+              <span className="status-value" style={{ color: suspiciousCount ? "#ff4b4b" : undefined }}>
                 {suspiciousCount}
               </span>
             </div>
             <div className="status-item">
               <span className="status-label">Last Updated</span>
               <span className="status-value">
-                {lastUpdated
-                  ? lastUpdated.toLocaleTimeString("en-IN", {
-                      hour12: false,
-                    })
-                  : "—"}
+                {lastUpdated ? lastUpdated.toLocaleTimeString("en-IN", { hour12: false }) : "—"}
               </span>
             </div>
           </div>
@@ -215,13 +201,8 @@ export default function App() {
                           </div>
                           <div className="alert-meta">
                             Src: <b>{a.src_ip}</b>
-                            {a.flags && a.flags.length > 0 && (
-                              <>
-                                {" "}
-                                • Flags: {a.flags.join(", ")}
-                              </>
-                            )}{" "}
-                            • {a.timestamp}
+                            {a.flags && a.flags.length > 0 && <> • Flags: {a.flags.join(", ")}</>}
+                            {" "}• {a.timestamp}
                           </div>
                         </div>
                       </>
@@ -229,12 +210,8 @@ export default function App() {
                       <>
                         <span className="alert-icon">⚠</span>
                         <div className="alert-body">
-                          <div className="alert-title">
-                            High frequency from <b>{a.src_ip}</b>
-                          </div>
-                          <div className="alert-meta">
-                            {a.count} req/min • {a.timestamp}
-                          </div>
+                          <div className="alert-title">High frequency from <b>{a.src_ip}</b></div>
+                          <div className="alert-meta">{a.count} req/min • {a.timestamp}</div>
                         </div>
                       </>
                     )}
@@ -264,35 +241,24 @@ export default function App() {
             <div className="kpi-card">
               <div className="kpi-label">Total Queries (current view)</div>
               <div className="kpi-value">{logs.length}</div>
-              <div className="kpi-subtext">
-                Latest 500 logs from live + API
-              </div>
+              <div className="kpi-subtext">Latest 500 logs from live + API</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Unique Domains</div>
               <div className="kpi-value">{uniqueDomains}</div>
-              <div className="kpi-subtext">
-                Distinct FQDNs observed in logs
-              </div>
+              <div className="kpi-subtext">Distinct FQDNs observed in logs</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Unique Source IPs</div>
               <div className="kpi-value">{uniqueIPs}</div>
-              <div className="kpi-subtext">
-                Client machines hitting DNS
-              </div>
+              <div className="kpi-subtext">Client machines hitting DNS</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Suspicious Alerts</div>
-              <div
-                className="kpi-value"
-                style={{ color: suspiciousCount ? "#ff4b4b" : "#00FF7F" }}
-              >
+              <div className="kpi-value" style={{ color: suspiciousCount ? "#ff4b4b" : "#00FF7F" }}>
                 {suspiciousCount}
               </div>
-              <div className="kpi-subtext">
-                Based on suspicious-domain rules
-              </div>
+              <div className="kpi-subtext">Based on suspicious-domain rules</div>
             </div>
           </section>
 
@@ -302,15 +268,14 @@ export default function App() {
             <div className="widget-wrapper">
               <h3 className="widget-title">Top Queried Domains</h3>
               <div style={{ width: "100%", height: 260 }}>
-                <ResponsiveContainer>
-                  <BarChart data={stats.topDomains}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={topDomains}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="domain" hide />
                     <YAxis />
                     <Tooltip />
                     <Legend />
                     <Bar dataKey="count" fill="#00eaff" />
-
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -320,21 +285,13 @@ export default function App() {
             <div className="widget-wrapper">
               <h3 className="widget-title">Most Active Source IPs</h3>
               <div style={{ width: "100%", height: 260 }}>
-                <ResponsiveContainer>
+                <ResponsiveContainer width="100%" height="100%">
                   <PieChart>
-                    <Pie
-                      data={stats.topIPs}
-                      dataKey="count"
-                      nameKey="ip"
-                      label
-                    />
-                    {stats.topIPs?.map((entry, index) => (
-                      <Cell
-                      key={`cell-${index}`}
-                      fill={index % 2 === 0 ? "#00ff7f" : "#ff4d4d"} // green & red
-                      />
+                    <Pie data={topIPs} dataKey="count" nameKey="ip" label>
+                      {topIPs.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={PIE_COLORS[index % PIE_COLORS.length]} />
                       ))}
-
+                    </Pie>
                     <Tooltip />
                     <Legend />
                   </PieChart>
@@ -347,24 +304,21 @@ export default function App() {
           <section className="widget-wrapper" style={{ marginTop: "1.5rem" }}>
             <h3 className="widget-title">Queries per Minute (Last 60 Minutes)</h3>
             <div style={{ width: "100%", height: 260 }}>
-              <ResponsiveContainer>
-                <LineChart data={stats.perMinute}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={perMinute}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="minute" />
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  <Line type="monotone" dataKey="count" />
+                  <Line type="monotone" dataKey="count" stroke="#00eaff" dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
           </section>
 
           {/* LOG TABLE */}
-          <section
-            className="widget-wrapper"
-            style={{ marginTop: "1.5rem", padding: "1.25rem" }}
-          >
+          <section className="widget-wrapper" style={{ marginTop: "1.5rem", padding: "1.25rem" }}>
             <h3 className="widget-title">Live DNS Log Stream</h3>
             {logs.length === 0 ? (
               <div className="empty-logs-message">No DNS logs yet…</div>

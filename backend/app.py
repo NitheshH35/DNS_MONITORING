@@ -2,16 +2,16 @@
 from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
 from flask_socketio import SocketIO
-import sqlite3, csv, io, re, datetime as dt
+import sqlite3, csv, io, re
 import math
 import tldextract
 import idna
 import whois
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from collections import Counter
 import os
 
-DB_PATH = r"C:\Users\Nithesh\OneDrive\Desktop\dns-monitoring\backend\database.db"
+DB_PATH = r"C:\Users\Nithesh\DNS_MONITORING\backend\database.db"
 
 app = Flask(__name__, static_folder="../frontend")
 CORS(app)
@@ -98,11 +98,14 @@ LONG_LABEL_RE = re.compile(r'[a-z0-9]{16,}', re.I)
 BLOCKLIST = set()
 BLOCKLIST_PATH = os.path.join(os.path.dirname(__file__), "blocklist.txt")
 if os.path.exists(BLOCKLIST_PATH):
-    with open(BLOCKLIST_PATH, "r", encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip().lower()
-            if ln and not ln.startswith("#"):
-                BLOCKLIST.add(ln)
+    try:
+        with open(BLOCKLIST_PATH, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip().lower()
+                if ln and not ln.startswith("#"):
+                    BLOCKLIST.add(ln)
+    except Exception:
+        BLOCKLIST = set()
 
 def calculate_entropy(s: str) -> float:
     if not s:
@@ -117,7 +120,7 @@ def calculate_entropy(s: str) -> float:
 
 def whois_cached(domain: str):
     """
-    Return creation_date as datetime or None.
+    Return creation_date as timezone-aware datetime (UTC) or None.
     Uses whois_cache table to avoid repeated whois calls.
     """
     conn = sqlite3.connect(DB_PATH)
@@ -126,18 +129,25 @@ def whois_cached(domain: str):
     # check cache
     cur.execute("SELECT creation_date, fetched_at FROM whois_cache WHERE domain = ?", (domain,))
     row = cur.fetchone()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if row:
         creation_date_str, fetched_at_str = row
         try:
             if fetched_at_str:
                 fetched_at = datetime.fromisoformat(fetched_at_str)
+                # ensure fetched_at is timezone-aware
+                if fetched_at.tzinfo is None:
+                    fetched_at = fetched_at.replace(tzinfo=timezone.utc)
                 if (now - fetched_at).days <= WHOIS_CACHE_TTL_DAYS:
                     conn.close()
                     if not creation_date_str:
                         return None
-                    return datetime.fromisoformat(creation_date_str)
+                    cd = datetime.fromisoformat(creation_date_str)
+                    if cd.tzinfo is None:
+                        cd = cd.replace(tzinfo=timezone.utc)
+                    return cd
         except Exception:
+            # fall through to re-fetch if parse fails
             pass
 
     # not cached or expired -> perform whois (slow)
@@ -145,12 +155,14 @@ def whois_cached(domain: str):
     try:
         w = whois.whois(domain)
         cd = w.creation_date
+        # handle lists returned by some whois libs
         if isinstance(cd, list) and cd:
             cd = cd[0]
+        # If cd is already a datetime, normalize tzinfo
         if isinstance(cd, datetime):
             creation_date = cd
         else:
-            # attempt parse if string
+            # sometimes string - try parse with fromisoformat, otherwise None
             try:
                 creation_date = datetime.fromisoformat(str(cd))
             except Exception:
@@ -158,7 +170,15 @@ def whois_cached(domain: str):
     except Exception:
         creation_date = None
 
-    # update cache
+    # Normalize to timezone-aware UTC if possible
+    if isinstance(creation_date, datetime):
+        if creation_date.tzinfo is None:
+            creation_date = creation_date.replace(tzinfo=timezone.utc)
+        else:
+            # convert to UTC
+            creation_date = creation_date.astimezone(timezone.utc)
+
+    # update cache with ISO strings (or None)
     try:
         cur.execute(
             "REPLACE INTO whois_cache (domain, creation_date, fetched_at) VALUES (?, ?, ?)",
@@ -170,6 +190,7 @@ def whois_cached(domain: str):
     conn.close()
     return creation_date
 
+
 def detection_pipeline(domain: str) -> dict:
     """
     Returns dict:
@@ -177,7 +198,10 @@ def detection_pipeline(domain: str) -> dict:
     """
     flags = []
     layers = {'1': [], '2': [], '3': []}
-    d = domain.lower().strip('.')
+    d = (domain or "").lower().strip('.')
+
+    if not d:
+        return {'flags': [], 'confidence': 'low', 'layers': layers}
 
     # Blocklist exact or suffix match (fast)
     for bad in BLOCKLIST:
@@ -218,6 +242,9 @@ def detection_pipeline(domain: str) -> dict:
             layers['2'].append(f'Punycode:{encoded}'); flags.append('IDN/Punycode')
     except idna.IDNAError:
         layers['2'].append('IDNError'); flags.append('IDNError')
+    except Exception:
+        # any other IDNA-related failure -> mark as IDNError but continue
+        layers['2'].append('IDNError'); flags.append('IDNError')
 
     # Brand impersonation (brand + phishing word)
     for brand in BRAND_WORDS:
@@ -232,11 +259,12 @@ def detection_pipeline(domain: str) -> dict:
         return {'flags': flags, 'confidence': 'high' if layers['2'] else 'medium', 'layers': layers}
 
     # ------ Layer 3: Registration analysis / WHOIS (slow) ------
-    # use registered_domain (example.com) or domain fallback
-    registered = te.registered_domain or te.domain or d
+    # prefer non-deprecated attribute if available
+    registered = getattr(te, "top_domain_under_public_suffix", None) or getattr(te, "registered_domain", None) or te.domain or d
     creation_date = whois_cached(registered)
     if creation_date:
-        age_days = (datetime.utcnow() - creation_date).days
+        # both creation_date and now are timezone-aware (UTC) so subtraction is safe
+        age_days = (datetime.now(timezone.utc) - creation_date).days
         layers['3'].append(f'AgeDays:{age_days}')
         if age_days >= 0 and age_days < NEW_DOMAIN_DAYS:
             flags.append('NewlyRegistered')
@@ -273,7 +301,13 @@ def alerts():
             continue
         seen_domains.add(domain)
 
-        res = detection_pipeline(domain)
+        try:
+            res = detection_pipeline(domain)
+        except Exception as e:
+            # If detection fails for a domain, continue and log minimal info
+            print("detection error for", domain, ":", e)
+            continue
+
         if res['flags']:
             susp.append({
                 'type': 'SuspiciousDomain',
@@ -322,7 +356,7 @@ def ingest():
     domain = data.get('domain')
     src_ip = data.get('src_ip')
     dst_ip = data.get('dst_ip')   # 👈 NEW
-    ts = data.get('timestamp') or dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ts = data.get('timestamp') or datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
     if not (domain and src_ip):
         return jsonify({'ok': False, 'error': 'missing fields'}), 400

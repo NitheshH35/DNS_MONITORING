@@ -1,2 +1,10 @@
-flask
+Flask
+flask-cors
+flask-socketio
+python-socketio
+eventlet
 scapy
+requests
+python-whois
+tldextract
+idna

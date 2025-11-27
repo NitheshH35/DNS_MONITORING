@@ -1,13 +1,13 @@
+# backend/create_db.py
 import sqlite3
+from pathlib import Path
 
-DB_PATH = r"C:\Users\Nithesh\OneDrive\Desktop\dns-monitoring\backend\database.db"
+DB_PATH = Path("database.db").resolve().as_posix()
 
-# Connect (creates database.db if it doesn't exist)
 conn = sqlite3.connect(DB_PATH)
-cursor = conn.cursor()
+cur = conn.cursor()
 
-# Create the table for storing DNS logs (now with dst_ip)
-cursor.execute("""
+cur.execute("""
 CREATE TABLE IF NOT EXISTS dns_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT,
@@ -19,5 +19,4 @@ CREATE TABLE IF NOT EXISTS dns_logs (
 
 conn.commit()
 conn.close()
-
-print("✅ Database and table created successfully!")
+print("✅ database and dns_logs table created at:", DB_PATH)
